@@ -1,8 +1,8 @@
 
 from os import path
+import numpy as np
 
 from models.loss_functions import *
-import tensorflow.contrib.layers as slim
 from utilities.utls import read_numpy_file, make_dirs
 
 class hed_net():
@@ -35,23 +35,44 @@ class hed_net():
     def variable_with_weight_decay(self, name, shape, stddev,wd=None):
 
         var = self.variable_on_cpu(name=name,shape=shape, \
-                initializer=tf.truncated_normal_initializer(mean=0.,stddev=stddev))
+                initializer=tf.keras.initializers.Zeros())  # previous tf.truncated_normal_initializer(mean=0.,stdded=0.01)
+        # tf.contrib.layers.xavier_initializer()
         if wd is not None:
-            weight_decay = tf.multiply(tf.nn.l2_loss(var), wd, name='weight_loss')
+            weight_decay = tf.multiply(tf.nn.l2_loss(var), wd, name=name+'_weight_loss')
             tf.add_to_collection('losses', weight_decay)
         return var
+
+    def get_bilinear_weight(self, k_size,out_chanels=1,name=''):
+
+        factor = (k_size+1)//2
+        if k_size%2==1:
+            center =factor-1
+        else:
+            center=factor-0.5
+        og = np.ogrid[:k_size,:k_size]
+        filt = (1-abs(og[0]-center)/factor)*(1-abs(og[1]-center)/factor)
+        w=np.zeros((k_size,k_size,out_chanels,out_chanels))
+        for i in range(out_chanels):
+            for j in range(out_chanels):
+                if i==j:
+                    w[:,:,i,j]=filt
+        init = tf.constant_initializer(value=w,dtype=tf.float32)
+        return tf.get_variable(name=name, initializer=init,shape=w.shape)
 
     def conv2d(self, input, output, k, s, name='',use_bias=True,use_trained=False,weight_decay=None):
 
         if use_trained:
             with tf.variable_scope(name):
 
-
-                w = tf.constant(self.vgg16_weights[name+'_W'], dtype=tf.float32)
+                w_shape = self.vgg16_weights[name+'_W'].shape
+                w_init = tf.constant_initializer(self.vgg16_weights[name+'_W'], dtype=tf.float32)
+                w = tf.get_variable(name=name+'_W', initializer=w_init, shape=w_shape)
                 conv = tf.nn.conv2d(input=input,filter=w,strides=[1,s,s,1],padding="SAME",
                                     name=name)
                 if use_bias:
-                    b = tf.constant(self.vgg16_weights[name + '_b'],dtype=tf.float32)
+                    b_shape = self.vgg16_weights[name + '_b'].shape
+                    b_init =tf.constant_initializer(self.vgg16_weights[name + '_b'],dtype=tf.float32)
+                    b = tf.get_variable(name=name+'_b',shape=b_shape, initializer=b_init)
                     conv = tf.nn.bias_add(conv,b)
                 return tf.nn.relu(conv)
         else:
@@ -61,7 +82,7 @@ class hed_net():
             conv = tf.nn.conv2d(input=input,filter=w,strides=[1, s, s, 1],padding="SAME",
                                 name=name)
             if use_bias:
-                b = self.variable_on_cpu(name=name + '_B', shape=[output],
+                b = self.variable_on_cpu(name=name + '_b', shape=[output],
                                          initializer=tf.constant_initializer(0.0))
                 conv = tf.nn.bias_add(conv,b)
 
@@ -73,13 +94,30 @@ class hed_net():
                                   padding='SAME',name=name)
         return max_pool
 
-    def side_output(self,input,weigth_decay=None,name=None):
+    def up_sampling(self, input, stride, output_shape=None, up_scale=2,name=''):
+        k_size =up_scale*2 # previous stride
+        w= self.get_bilinear_weight(k_size,output_shape[-1],name=name+'_W')
+        output_shape =tf.stack(output_shape)
+        output = tf.nn.conv2d_transpose(value=input,filter=w,
+                                        output_shape=output_shape,
+                                        strides=[1,up_scale,up_scale,1],
+                                        name = name, padding='SAME')
+        return output
+
+    def side_output(self,input,weigth_decay=None,name=None, up_scale=2):
 
         output = self.conv2d(input=input,output=1, k=1,s=1,name=name+'_conv', use_bias=False,
                              weight_decay=self.args.weight_decay)
 
-        output = tf.image.resize_bilinear(images=output,size=[self.args.image_height, \
-                    self.args.image_width])
+        # output = tf.image.resize_bilinear(images=output,size=[self.args.image_height, \
+        #             self.args.image_width],align_corners=True)
+        c_shape = output.get_shape().as_list()[2]
+
+        if c_shape != self.args.image_width:
+            in_shape = tf.shape(input)
+            out_shape = [in_shape[0],self.args.image_height,self.args.image_width,1]
+            output = self.up_sampling(input=output,stride=2,output_shape=out_shape,
+                                      name=name+'_ldconv',up_scale=up_scale)
         return output
 
 
@@ -97,28 +135,28 @@ class hed_net():
             # block 2
             self.conv2_1 = self.conv2d(input=self.max_pool1,output=128,k=3,s=1,name='conv2_1',use_trained=True)
             self.conv2_2 = self.conv2d(input=self.conv2_1,output=128,k=3,s=1,name='conv2_2',use_trained=True)
-            self.output_2 = self.side_output(self.conv2_2, name='output2')
+            self.output_2 = self.side_output(self.conv2_2, name='output2', up_scale=2)
             self.max_pool2 = self.max_polling(self.conv2_2, name='maxpool2')
 
             # block 3
             self.conv3_1 = self.conv2d(input=self.max_pool2,output=256,k=3,s=1,name='conv3_1',use_trained=True)
             self.conv3_2 = self.conv2d(input=self.conv3_1, output=256, k=3, s=1, name='conv3_2',use_trained=True)
             self.conv3_3 = self.conv2d(input=self.conv3_2, output=256, k=3, s=1, name='conv3_3',use_trained=True)
-            self.output_3 = self.side_output(self.conv3_3, name='output3')
+            self.output_3 = self.side_output(self.conv3_3, name='output3', up_scale=4)
             self.max_pool3 = self.max_polling(self.conv3_3, name='maxpool3')
 
             # block 4
             self.conv4_1 = self.conv2d(input=self.max_pool3, output=512, k=3, s=1, name='conv4_1',use_trained=True)
             self.conv4_2 = self.conv2d(input=self.conv4_1, output=512, k=3, s=1, name='conv4_2',use_trained=True)
             self.conv4_3 = self.conv2d(input=self.conv4_2, output=512, k=3, s=1, name='conv4_3',use_trained=True)
-            self.output_4 = self.side_output(self.conv4_3, name='output4')
+            self.output_4 = self.side_output(self.conv4_3, name='output4',up_scale=8)
             self.max_pool4 = self.max_polling(self.conv4_3, name='maxpool4')
 
             # block 5
             self.conv5_1 = self.conv2d(input=self.max_pool4, output=512, k=3, s=1, name='conv5_1',use_trained=True)
             self.conv5_2 = self.conv2d(input=self.conv5_1, output=512, k=3, s=1, name='conv5_2',use_trained=True)
             self.conv5_3 = self.conv2d(input=self.conv5_2, output=512, k=3, s=1, name='conv5_3',use_trained=True)
-            self.output_5 = self.side_output(self.conv5_3, name='output5')
+            self.output_5 = self.side_output(self.conv5_3, name='output5',up_scale=16)
 
             self.side_outputs = [self.output_1, self.output_2, self.output_3,
                                  self.output_4, self.output_5]
@@ -150,17 +188,21 @@ class hed_net():
         for idx, b in enumerate(self.side_outputs):
             output = tf.nn.sigmoid(b, name='output_{}'.format(idx))
             cost = sigmoid_cross_entropy_balanced(b, self.edgemaps, name='cross_entropy{}'.format(idx))
+            # before sigmoid_cross_entropy_balanced
 
             self.predictions.append(output)
             if self.args.deep_supervision:
-                tf.add_to_collection('losses', (self.args.loss_weights * cost))
-                self.loss += (self.args.loss_weights * cost)
+                s_cost = (self.args.loss_weights * cost)
+                tf.add_to_collection('losses', s_cost)
+                self.loss += cost
                 #deep_supervision
         self.fuse_output = tf.nn.sigmoid(self.fuse, name='fuse')
         fuse_cost = sigmoid_cross_entropy_balanced(self.fuse, self.edgemaps, name='cross_entropy_fuse')
 
         self.predictions.append(self.fuse_output)
-        self.loss += (self.args.loss_weights * fuse_cost)
+        f_cost = (self.args.loss_weights * fuse_cost)
+        tf.add_to_collection('losses', f_cost)
+        self.loss += f_cost
 
         # *************evaluation code
         tf.add_to_collection('losses',self.loss)
@@ -187,3 +229,5 @@ class hed_net():
         self.merged_summary = tf.summary.merge_all()
         self.train_writer = tf.summary.FileWriter(train_log_dir, session.graph)
         self.val_writer = tf.summary.FileWriter(val_log_dir)
+
+    def prepare_aligned_crop
