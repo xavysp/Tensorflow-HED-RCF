@@ -230,4 +230,80 @@ class hed_net():
         self.train_writer = tf.summary.FileWriter(train_log_dir, session.graph)
         self.val_writer = tf.summary.FileWriter(val_log_dir)
 
-    def prepare_aligned_crop
+    def prepare_aligned_crop(self):
+        """ Prepare for aligned crop. """
+
+        # Re-implement the logic in deploy.prototxt and
+        #   /hed/src/caffe/layers/crop_layer.cpp of official repo.
+        # Other reference materials:
+        #   hed/include/caffe/layer.hpp
+        #   hed/include/caffe/vision_layers.hpp
+        #   hed/include/caffe/util/coords.hpp
+        #   https://groups.google.com/forum/#!topic/caffe-users/YSRYy7Nd9J8
+
+        def map_inv(m):
+            """ Mapping inverse. """
+            a, b = m
+            return 1 / a, -b / a
+
+        def map_compose(m1, m2):
+            """ Mapping compose. """
+            a1, b1 = m1
+            a2, b2 = m2
+            return a1 * a2, a1 * b2 + b1
+
+        def deconv_map(kernel_h, stride_h, pad_h):
+            """ Deconvolution coordinates mapping. """
+            return stride_h, (kernel_h - 1) / 2 - pad_h
+
+        def conv_map(kernel_h, stride_h, pad_h):
+            """ Convolution coordinates mapping. """
+            return map_inv(deconv_map(kernel_h, stride_h, pad_h))
+
+        def pool_map(kernel_h, stride_h, pad_h):
+            """ Pooling coordinates mapping. """
+            return conv_map(kernel_h, stride_h, pad_h)
+
+        x_map = (1, 0)
+        conv1_1_map = map_compose(conv_map(3, 1, 35), x_map)
+        conv1_2_map = map_compose(conv_map(3, 1, 1), conv1_1_map)
+        pool1_map = map_compose(pool_map(2, 2, 0), conv1_2_map)
+
+        conv2_1_map = map_compose(conv_map(3, 1, 1), pool1_map)
+        conv2_2_map = map_compose(conv_map(3, 1, 1), conv2_1_map)
+        pool2_map = map_compose(pool_map(2, 2, 0), conv2_2_map)
+
+        conv3_1_map = map_compose(conv_map(3, 1, 1), pool2_map)
+        conv3_2_map = map_compose(conv_map(3, 1, 1), conv3_1_map)
+        conv3_3_map = map_compose(conv_map(3, 1, 1), conv3_2_map)
+        pool3_map = map_compose(pool_map(2, 2, 0), conv3_3_map)
+
+        conv4_1_map = map_compose(conv_map(3, 1, 1), pool3_map)
+        conv4_2_map = map_compose(conv_map(3, 1, 1), conv4_1_map)
+        conv4_3_map = map_compose(conv_map(3, 1, 1), conv4_2_map)
+        pool4_map = map_compose(pool_map(2, 2, 0), conv4_3_map)
+
+        conv5_1_map = map_compose(conv_map(3, 1, 1), pool4_map)
+        conv5_2_map = map_compose(conv_map(3, 1, 1), conv5_1_map)
+        conv5_3_map = map_compose(conv_map(3, 1, 1), conv5_2_map)
+
+        score_dsn1_map = conv1_2_map
+        score_dsn2_map = conv2_2_map
+        score_dsn3_map = conv3_3_map
+        score_dsn4_map = conv4_3_map
+        score_dsn5_map = conv5_3_map
+
+        upsample2_map = map_compose(deconv_map(4, 2, 0), score_dsn2_map)
+        upsample3_map = map_compose(deconv_map(8, 4, 0), score_dsn3_map)
+        upsample4_map = map_compose(deconv_map(16, 8, 0), score_dsn4_map)
+        upsample5_map = map_compose(deconv_map(32, 16, 0), score_dsn5_map)
+
+        crop1_margin = int(score_dsn1_map[1])
+        crop2_margin = int(upsample2_map[1])
+        crop3_margin = int(upsample3_map[1])
+        crop4_margin = int(upsample4_map[1])
+
+        crop5_margin = int(upsample5_map[1])
+
+        return crop1_margin, crop2_margin, crop3_margin, crop4_margin, crop5_margin
+
