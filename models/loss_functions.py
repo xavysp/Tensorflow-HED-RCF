@@ -47,21 +47,46 @@ def class_balanced_cross_entropy_with_logits(logits,label,name='class_ballanced_
 
         return tf.where(tf.equal(beta,1.0),0.0,loss)
 
-def truth_difference_error(prediction,label,name='truth_label_error'):
-    """
+def cross_entropy_loss_RCFpy(logits, label):
+    label = label.long()
+    mask = label.float()
+    num_positive = torch.sum((mask==1).float()).float()
+    num_negative = torch.sum((mask==0).float()).float()
 
-    :param prediction:
-    :param laleb:
-    :param name:
-    :return:
-    """
-    p = tf.nn.l2_normalize(prediction,axis=3)
-    def tf_round(num,dec=3):
-        multi = tf.constant(10**dec, dtype=tf.float32)
-        return tf.round(num*multi)/multi
-    p = tf_round(p,dec=3)
-    y = tf_round(label,dec=3)
+    mask[mask == 1] = 1.0 * num_negative / (num_positive + num_negative)
+    mask[mask == 0] = 1.1 * num_positive / (num_positive + num_negative)
+    mask[mask == 2] = 0
 
-    # tle = 1-(tf.reduce_sum((p+y)-p)/tf.reduce_sum(y))
-    mse = tf.losses.mean_squared_error(predictions=p,labels=y)
-    return mse
+    # print('num pos', num_positive)
+    # print('num neg', num_negative)
+    # print(1.0 * num_negative / (num_positive + num_negative), 1.1 * num_positive / (num_positive + num_negative))
+
+    cost = torch.nn.functional.binary_cross_entropy(
+            logits.float(),label.float(), weight=mask, reduce=False)
+    return torch.sum(cost) / (num_negative + num_positive)
+
+
+def cross_entropy_loss_RCFtf(logits, label,name=''):
+    logits = tf.cast(logits, tf.float32)
+    lab = tf.cast(label,tf.float32)
+    num_positive = tf.reduce_sum(lab)
+    num_negative = tf.reduce_sum(1.-lab)
+
+    beta = num_negative/(num_positive+num_negative)
+
+    # mask[mask == 1] = 1.0 * num_negative / (num_positive + num_negative)
+    # mask[mask == 0] = 1.1 * num_positive / (num_positive + num_negative)
+    # mask[mask == 2] = 0
+    # pos_weights = beta/(1-beta)
+    pos_weights = 2/(beta*(1-beta))
+    a_w = label
+    # all_w = tf.where(tf.equal(a_w,1.0),1.0 * num_negative / (num_positive + num_negative),
+    #                  1.1 * num_negative / (num_positive + num_negative))
+    # allw = tf.cond(tf.equal(a_w, 1), true_fn=1.0 * num_negative / (num_positive + num_negative),
+    #                false_fn=1.1 * num_negative / (num_positive + num_negative))
+    cost= tf.nn.weighted_cross_entropy_with_logits(targets=label,
+                                                   logits=logits,pos_weight=pos_weights)
+    loss = tf.reduce_mean((1-beta)*cost)
+    # loss = tf.reduce_sum(cost)/(num_positive+num_negative)
+    # tf.where(tf.equal(beta, 1.0), 0.0, loss), a_w, logits
+    return tf.where(tf.equal(beta, 1.0), 0.0, loss,name=name)

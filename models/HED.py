@@ -3,15 +3,17 @@ from os import path
 import numpy as np
 
 from models.loss_functions import *
-from utilities.utls import read_numpy_file, make_dirs
+from utilities.utls import read_pretrained_data, make_dirs
 
 class hed_net():
 
     def __init__(self, args):
         self.args =args
+        self.im_height= args.image_height
+        self.im_width = args.image_width
         if args.use_trained_weights:
             weights_fir = 'models'
-            self.vgg16_weights = read_numpy_file(weights_fir,args.vgg16_param)
+            self.vgg16_weights = read_pretrained_data(weights_fir,args.vgg16_param)
         self.input = tf.placeholder(tf.float32,[None,args.image_height, \
             args.image_width, args.n_channels],name='input')
 
@@ -36,7 +38,7 @@ class hed_net():
 
         var = self.variable_on_cpu(name=name,shape=shape, \
                 initializer=tf.keras.initializers.Zeros())  # previous tf.truncated_normal_initializer(mean=0.,stdded=0.01)
-        # tf.contrib.layers.xavier_initializer()
+        # tf.contrib.layers.xavier_initializer() / tf.keras.initializers.Zeros()
         if wd is not None:
             weight_decay = tf.multiply(tf.nn.l2_loss(var), wd, name=name+'_weight_loss')
             tf.add_to_collection('losses', weight_decay)
@@ -94,32 +96,143 @@ class hed_net():
                                   padding='SAME',name=name)
         return max_pool
 
-    def up_sampling(self, input, stride, output_shape=None, up_scale=2,name=''):
-        k_size =up_scale*2 # previous stride
-        w= self.get_bilinear_weight(k_size,output_shape[-1],name=name+'_W')
-        output_shape =tf.stack(output_shape)
-        output = tf.nn.conv2d_transpose(value=input,filter=w,
-                                        output_shape=output_shape,
-                                        strides=[1,up_scale,up_scale,1],
-                                        name = name, padding='SAME')
-        return output
+    def _upscore_layer(self, input, shape, n_outputs, name,
+                       ksize=4, stride=2):
+        strides = [1, stride, stride, 1]
+        with tf.variable_scope(name):
+            in_features = input.get_shape()[3].value
+
+            if shape is None:
+                # Compute shape out of Bottom
+                in_shape = tf.shape(input)
+
+                h = ((in_shape[1] - 1) * stride) + 1
+                w = ((in_shape[2] - 1) * stride) + 1
+                new_shape = [in_shape[0], h, w, n_outputs]
+            else:
+                new_shape = [shape[0], shape[1], shape[2], n_outputs]
+            output_shape = tf.stack(new_shape)
+
+            f_shape = [ksize, ksize, n_outputs, in_features]
+
+            # create
+            num_input = ksize * ksize * in_features / stride
+            stddev = (2 / num_input) ** 0.5
+
+            weights = self.get_deconv_filter(f_shape)
+            deconv = tf.nn.conv2d_transpose(input, weights, output_shape,
+                                            strides=strides, padding='SAME')
+        # _activation_summary(deconv)
+        return deconv
+
+    def get_deconv_filter(self, f_shape):
+        width = f_shape[0]
+        heigh = f_shape[0]
+        f = np.ceil(width / 2.0)
+        c = (2 * f - 1 - f % 2) / (2.0 * f)
+        bilinear = np.zeros([f_shape[0], f_shape[1]])
+        for x in range(width):
+            for y in range(heigh):
+                value = (1 - abs(x / f - c)) * (1 - abs(y / f - c))
+                bilinear[x, y] = value
+        weights = np.zeros(f_shape)
+        for i in range(f_shape[2]):
+            weights[:, :, i, i] = bilinear
+
+        init = tf.constant_initializer(value=weights,
+                                       dtype=tf.float32)
+
+        return tf.get_variable(name="up_filter", initializer=init, shape=weights.shape)
 
     def side_output(self,input,weigth_decay=None,name=None, up_scale=2):
 
         output = self.conv2d(input=input,output=1, k=1,s=1,name=name+'_conv', use_bias=False,
                              weight_decay=self.args.weight_decay)
-
-        # output = tf.image.resize_bilinear(images=output,size=[self.args.image_height, \
-        #             self.args.image_width],align_corners=True)
         c_shape = output.get_shape().as_list()[2]
 
         if c_shape != self.args.image_width:
-            in_shape = tf.shape(input)
-            out_shape = [in_shape[0],self.args.image_height,self.args.image_width,1]
-            output = self.up_sampling(input=output,stride=2,output_shape=out_shape,
-                                      name=name+'_ldconv',up_scale=up_scale)
+            output = tf.image.resize_bilinear(images=output,size=[self.args.image_height, \
+                        self.args.image_width],align_corners=True)
+            # in_shape = tf.shape(input)
+            # out_shape = [in_shape[0],self.args.image_height,self.args.image_width,1]
+            # output = self.up_sampling(input=output,stride=2,output_shape=out_shape,
+            #                           name=name+'_ldconv',up_scale=up_scale)
         return output
 
+    def prepare_aligned_crop(self):
+        """ Prepare for aligned crop. """
+        # Re-implement the logic in deploy.prototxt and
+        #   /hed/src/caffe/layers/crop_layer.cpp of official repo.
+        # Other reference materials:
+        #   hed/include/caffe/layer.hpp
+        #   hed/include/caffe/vision_layers.hpp
+        #   hed/include/caffe/util/coords.hpp
+        #   https://groups.google.com/forum/#!topic/caffe-users/YSRYy7Nd9J8
+
+        def map_inv(m):
+            """ Mapping inverse. """
+            a, b = m
+            return 1 / a, -b / a
+
+        def map_compose(m1, m2):
+            """ Mapping compose. """
+            a1, b1 = m1
+            a2, b2 = m2
+            return a1 * a2, a1 * b2 + b1
+
+        def deconv_map(kernel_h, stride_h, pad_h):
+            """ Deconvolution coordinates mapping. """
+            return stride_h, (kernel_h - 1) / 2 - pad_h
+
+        def conv_map(kernel_h, stride_h, pad_h):
+            """ Convolution coordinates mapping. """
+            return map_inv(deconv_map(kernel_h, stride_h, pad_h))
+
+        def pool_map(kernel_h, stride_h, pad_h):
+            """ Pooling coordinates mapping. """
+            return conv_map(kernel_h, stride_h, pad_h)
+
+        x_map = (1, 0)
+        conv1_1_map = map_compose(conv_map(3, 1, 35), x_map)
+        conv1_2_map = map_compose(conv_map(3, 1, 1), conv1_1_map)
+        pool1_map = map_compose(pool_map(2, 2, 0), conv1_2_map)
+
+        conv2_1_map = map_compose(conv_map(3, 1, 1), pool1_map)
+        conv2_2_map = map_compose(conv_map(3, 1, 1), conv2_1_map)
+        pool2_map = map_compose(pool_map(2, 2, 0), conv2_2_map)
+
+        conv3_1_map = map_compose(conv_map(3, 1, 1), pool2_map)
+        conv3_2_map = map_compose(conv_map(3, 1, 1), conv3_1_map)
+        conv3_3_map = map_compose(conv_map(3, 1, 1), conv3_2_map)
+        pool3_map = map_compose(pool_map(2, 2, 0), conv3_3_map)
+
+        conv4_1_map = map_compose(conv_map(3, 1, 1), pool3_map)
+        conv4_2_map = map_compose(conv_map(3, 1, 1), conv4_1_map)
+        conv4_3_map = map_compose(conv_map(3, 1, 1), conv4_2_map)
+        pool4_map = map_compose(pool_map(2, 2, 0), conv4_3_map)
+
+        conv5_1_map = map_compose(conv_map(3, 1, 1), pool4_map)
+        conv5_2_map = map_compose(conv_map(3, 1, 1), conv5_1_map)
+        conv5_3_map = map_compose(conv_map(3, 1, 1), conv5_2_map)
+
+        score_dsn1_map = conv1_2_map
+        score_dsn2_map = conv2_2_map
+        score_dsn3_map = conv3_3_map
+        score_dsn4_map = conv4_3_map
+        score_dsn5_map = conv5_3_map
+
+        upsample2_map = map_compose(deconv_map(4, 2, 0), score_dsn2_map)
+        upsample3_map = map_compose(deconv_map(8, 4, 0), score_dsn3_map)
+        upsample4_map = map_compose(deconv_map(16, 8, 0), score_dsn4_map)
+        upsample5_map = map_compose(deconv_map(32, 16, 0), score_dsn5_map)
+
+        crop1_margin = int(score_dsn1_map[1])
+        crop2_margin = int(upsample2_map[1])
+        crop3_margin = int(upsample3_map[1])
+        crop4_margin = int(upsample4_map[1])
+        crop5_margin = int(upsample5_map[1])
+
+        return crop1_margin, crop2_margin, crop3_margin, crop4_margin, crop5_margin
 
     def define_model(self):
         with tf.variable_scope(self.args.model_name.lower()):
@@ -229,81 +342,4 @@ class hed_net():
         self.merged_summary = tf.summary.merge_all()
         self.train_writer = tf.summary.FileWriter(train_log_dir, session.graph)
         self.val_writer = tf.summary.FileWriter(val_log_dir)
-
-    def prepare_aligned_crop(self):
-        """ Prepare for aligned crop. """
-
-        # Re-implement the logic in deploy.prototxt and
-        #   /hed/src/caffe/layers/crop_layer.cpp of official repo.
-        # Other reference materials:
-        #   hed/include/caffe/layer.hpp
-        #   hed/include/caffe/vision_layers.hpp
-        #   hed/include/caffe/util/coords.hpp
-        #   https://groups.google.com/forum/#!topic/caffe-users/YSRYy7Nd9J8
-
-        def map_inv(m):
-            """ Mapping inverse. """
-            a, b = m
-            return 1 / a, -b / a
-
-        def map_compose(m1, m2):
-            """ Mapping compose. """
-            a1, b1 = m1
-            a2, b2 = m2
-            return a1 * a2, a1 * b2 + b1
-
-        def deconv_map(kernel_h, stride_h, pad_h):
-            """ Deconvolution coordinates mapping. """
-            return stride_h, (kernel_h - 1) / 2 - pad_h
-
-        def conv_map(kernel_h, stride_h, pad_h):
-            """ Convolution coordinates mapping. """
-            return map_inv(deconv_map(kernel_h, stride_h, pad_h))
-
-        def pool_map(kernel_h, stride_h, pad_h):
-            """ Pooling coordinates mapping. """
-            return conv_map(kernel_h, stride_h, pad_h)
-
-        x_map = (1, 0)
-        conv1_1_map = map_compose(conv_map(3, 1, 35), x_map)
-        conv1_2_map = map_compose(conv_map(3, 1, 1), conv1_1_map)
-        pool1_map = map_compose(pool_map(2, 2, 0), conv1_2_map)
-
-        conv2_1_map = map_compose(conv_map(3, 1, 1), pool1_map)
-        conv2_2_map = map_compose(conv_map(3, 1, 1), conv2_1_map)
-        pool2_map = map_compose(pool_map(2, 2, 0), conv2_2_map)
-
-        conv3_1_map = map_compose(conv_map(3, 1, 1), pool2_map)
-        conv3_2_map = map_compose(conv_map(3, 1, 1), conv3_1_map)
-        conv3_3_map = map_compose(conv_map(3, 1, 1), conv3_2_map)
-        pool3_map = map_compose(pool_map(2, 2, 0), conv3_3_map)
-
-        conv4_1_map = map_compose(conv_map(3, 1, 1), pool3_map)
-        conv4_2_map = map_compose(conv_map(3, 1, 1), conv4_1_map)
-        conv4_3_map = map_compose(conv_map(3, 1, 1), conv4_2_map)
-        pool4_map = map_compose(pool_map(2, 2, 0), conv4_3_map)
-
-        conv5_1_map = map_compose(conv_map(3, 1, 1), pool4_map)
-        conv5_2_map = map_compose(conv_map(3, 1, 1), conv5_1_map)
-        conv5_3_map = map_compose(conv_map(3, 1, 1), conv5_2_map)
-
-        score_dsn1_map = conv1_2_map
-        score_dsn2_map = conv2_2_map
-        score_dsn3_map = conv3_3_map
-        score_dsn4_map = conv4_3_map
-        score_dsn5_map = conv5_3_map
-
-        upsample2_map = map_compose(deconv_map(4, 2, 0), score_dsn2_map)
-        upsample3_map = map_compose(deconv_map(8, 4, 0), score_dsn3_map)
-        upsample4_map = map_compose(deconv_map(16, 8, 0), score_dsn4_map)
-        upsample5_map = map_compose(deconv_map(32, 16, 0), score_dsn5_map)
-
-        crop1_margin = int(score_dsn1_map[1])
-        crop2_margin = int(upsample2_map[1])
-        crop3_margin = int(upsample3_map[1])
-        crop4_margin = int(upsample4_map[1])
-
-        crop5_margin = int(upsample5_map[1])
-
-        return crop1_margin, crop2_margin, crop3_margin, crop4_margin, crop5_margin
 

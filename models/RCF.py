@@ -1,9 +1,10 @@
 
 from os import path
 from sys import exit
+import numpy as np
 
 from models.loss_functions import *
-from utilities.utls import read_numpy_file, make_dirs
+from utilities.utls import read_pretrained_data, make_dirs
 
 class rcf_net():
 
@@ -11,7 +12,7 @@ class rcf_net():
         self.args =args
         if args.use_trained_weights:
             weights_fir = 'models'
-            self.vgg16_weights = read_numpy_file(weights_fir,args.vgg16_param)
+            self.vgg16_weights = read_pretrained_data(weights_fir,args.vgg16_param)
         self.input = tf.placeholder(tf.float32,[None,args.image_height, \
             args.image_width, args.n_channels],name='input')
 
@@ -41,11 +42,28 @@ class rcf_net():
             tf.add_to_collection('losses', weight_decay)
         return var
 
+    def get_bilinear_weight(self, k_size,out_chanels=1):
+
+        factor = (k_size+1)//2
+        if k_size%2==1:
+            center =factor-1
+        else:
+            center=factor-0.5
+        og = np.ogrid[:k_size,:k_size]
+        filt = (1-abs(og[0]-center)/factor)*(1-abs(og[1]-center)/factor)
+        w=np.zeros((k_size,k_size,out_chanels,out_chanels))
+        for i in range(out_chanels):
+            for j in range(out_chanels):
+                if i==j:
+                    w[:,:,i,j]=filt
+
+        return tf.Variable(tf.constant(w,dtype=tf.float32),trainable=True)
+
+
     def conv2d(self, input, output, k, s, name='',use_bias=True,use_trained=False):
 
         if use_trained:
             with tf.variable_scope(name):
-
 
                 w = tf.constant(self.vgg16_weights[name+'_W'], dtype=tf.float32)
                 conv = tf.nn.conv2d(input=input,filter=w,strides=[1,s,s,1],padding="SAME",
@@ -66,6 +84,10 @@ class rcf_net():
                 conv = tf.nn.bias_add(conv,b)
 
         return conv
+
+    def up_sampling(self, input, stride, out_channels=1):
+        k_size =stride*2
+        w= self.get_bilinear_weight(k_size,out_channels)
 
     def max_polling(self, input,name=''):
 
@@ -90,6 +112,7 @@ class rcf_net():
             print("In side_output() at least 2 inputs have to have values assigned")
             exit()
         c_shape = output.get_shape().as_list()[2]
+
         if c_shape != self.args.image_width:
             s = self.args.image_width//c_shape
             output_shape = output.get_shape().as_list()
